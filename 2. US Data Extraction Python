@@ -1,0 +1,118 @@
+import requests
+import pandas as pd
+import time
+import os
+import sys
+from datetime import date, timedelta, datetime
+
+# CONFIGURATION
+API_KEY = 'API Key'
+ROOT_URL = 'https://api.setlist.fm/rest/1.0/search/setlists'
+headers = {'x-api-key': API_KEY, 'Accept': 'application/json'}
+
+
+
+def fetch_data_resume(country_code, country_name, year, start_month, end_month):
+    if end_month == 12:
+        end_date = date(year, 12, 31)
+    else:
+        end_date = date(year, end_month + 1, 1) - timedelta(days=1)
+
+
+    tracker_file = f"Data_{country_code}_{year}progress.txt"
+
+    if os.path.exists(tracker_file):
+        with open(tracker_file, 'r') as f:
+            last_date_str = f.read().strip()
+            last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+            current_date = last_date + timedelta(days=1)
+            print(f" Found progress file. Resuming safely from: {current_date}")
+    else:
+        current_date = date(year, start_month, 1)
+        print(f" Starting fresh extraction from: {current_date}")
+
+    if current_date > end_date:
+        print(" All data for the specified range has already been extracted!")
+        return
+
+    print(" Filtering active: ONLY saving events with populated setlists!")
+
+    delta = timedelta(days=1)
+
+    while current_date <= end_date:
+        date_str = current_date.strftime("%d-%m-%Y")
+        month = current_date.month
+        daily_events = []
+
+        params = {'countryCode': country_code, 'date': date_str, 'p': 1}
+
+        try:
+            response = requests.get(ROOT_URL, params=params, headers=headers)
+
+            if response.status_code == 429:
+                print("\n API Daily Rate Limit hit! Stopping script.")
+                sys.exit(0)
+
+            if response.status_code == 200:
+                data = response.json()
+                total_found = data.get('total', 0)
+                items_per_page = data.get('itemsPerPage', 20)
+                pages = (total_found // items_per_page) + 1
+
+                raw_events = data.get('setlist', [])
+                for event in raw_events:
+                    sets_data = event.get('sets', {})
+                    if isinstance(sets_data, dict) and sets_data.get('set'):
+                        daily_events.append(event)
+
+                if pages > 1:
+                    for p in range(2, pages + 1):
+                        params['p'] = p
+                        p_res = requests.get(ROOT_URL, params=params, headers=headers)
+
+                        if p_res.status_code == 429:
+                            print("\n API Rate Limit hit on pagination! Stopping script safely.")
+                            sys.exit(0)
+
+                        if p_res.status_code == 200:
+                            p_data = p_res.json()
+                            p_raw_events = p_data.get('setlist', [])
+
+                            for event in p_raw_events:
+                                sets_data = event.get('sets', {})
+                                if isinstance(sets_data, dict) and sets_data.get('set'):
+                                    daily_events.append(event)
+
+                        time.sleep(1.2)
+
+            elif response.status_code == 404:
+                pass
+
+            if daily_events:
+                df = pd.json_normalize(daily_events)
+                df['Country'] = country_code
+                df['Cancelled'] = 0
+
+
+                fname = f"{country_name}_{year}_Month_{str(month).zfill(2)}.csv"
+
+                write_header = not os.path.exists(fname)
+                df.to_csv(fname, mode='a', header=write_header, index=False)
+
+            with open(tracker_file, 'w') as f:
+                f.write(current_date.strftime("%Y-%m-%d"))
+
+            print(f"{country_name} | {date_str} | Valid Sets Kept & Saved: {len(daily_events)}")
+
+        except Exception as e:
+            print(f"Error on {date_str}: {e}")
+            if "429" in str(e):
+                print("Hit Limit. Exiting to preserve progress.")
+                sys.exit(0)
+
+        current_date += delta
+        time.sleep(1.1)
+
+
+# EXECUTION ---
+fetch_data_resume('US', 'US', 2024, 1, 12)
