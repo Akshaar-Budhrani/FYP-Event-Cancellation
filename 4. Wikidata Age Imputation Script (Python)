@@ -1,0 +1,83 @@
+import pandas as pd
+import os
+import json
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+input_path = 'UK_Success_Prepped_FINAL.csv'
+output_path = 'UK_Success_Prepped_RESCUED.csv'
+cache_path = 'wikidata_dob_cache.json'
+
+print("--- WIKIDATA AGE IMPUTATION PIPELINE ---")
+print("Loading primary dataset...")
+df = pd.read_csv(input_path, low_memory=False)
+
+# ==========================================
+# 1. LOAD WIKIDATA CACHE
+# ==========================================
+wikidata_dict = {}
+
+if os.path.exists(cache_path):
+    with open(cache_path, 'r') as f:
+        wikidata_dict = json.load(f)
+    print(f"Loaded {len(wikidata_dict)} previously rescued artist DOBs from cache.")
+else:
+    print("Warning: No Wikidata cache found. Proceeding with existing data.")
+
+# ==========================================
+# 2. THE ENTITY RESOLUTION FILTER
+# ==========================================
+print("\nMapping rescued dates back to the dataset...")
+df['Rescued_DOB'] = df['artist.name'].map(wikidata_dict)
+
+def safe_date_filter(d):
+    """
+    Filters out extreme data hallucinations (e.g., matching a modern singer 
+    to a 19th-century composer with the same name).
+    """
+    if pd.isna(d) or not isinstance(d, str):
+        return None
+    try:
+        # Extract the year from the YYYY-MM-DD string
+        year = int(d.split('-')[0])
+        # Temporal bounds: Drop dates before 1900 or future dates
+        if year < 1900 or year > 2024:
+            return None
+        return d
+    except Exception:
+        return None
+
+# Apply the feasibility bounds
+df['Rescued_DOB'] = df['Rescued_DOB'].apply(safe_date_filter)
+
+# ==========================================
+# 3. DATA MERGE
+# ==========================================
+df['Rescued_DOB'] = pd.to_datetime(df['Rescued_DOB'], errors='coerce')
+df['eventDate'] = pd.to_datetime(df['eventDate'], errors='coerce')
+
+# Calculate the precise age (Years Active) at the time of the event
+df['Rescued_Years_Active'] = (df['eventDate'] - df['Rescued_DOB']).dt.days / 365.25
+
+# Identify rows where we successfully rescued a valid date
+mask_rescued = df['Rescued_Years_Active'].notna()
+
+# Overwrite the main columns ONLY for successfully rescued rows
+df.loc[mask_rescued, 'Entity_Years_Active'] = df.loc[mask_rescued, 'Rescued_Years_Active'].round(1)
+df.loc[mask_rescued, 'Age_Missing'] = 0
+
+# Clean up temporary calculation columns
+df = df.drop(columns=['Rescued_DOB', 'Rescued_Years_Active'])
+
+# ==========================================
+# 4. FINAL EXPORT & STATS
+# ==========================================
+df.to_csv(output_path, index=False)
+
+total_persons = len(df[df['Entity_Type'] == 'Person'])
+rescued_count = len(df[(df['Entity_Type'] == 'Person') & (df['Age_Missing'] == 0)])
+
+print("\nAge Imputation Complete.")
+print(f"Successfully identified ages for {rescued_count} solo artists (out of {total_persons} total 'Persons').")
+print(f"Final dataset saved to: {output_path}")
