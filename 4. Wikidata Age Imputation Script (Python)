@@ -6,7 +6,7 @@ import json
 # CONFIGURATION
 # ==========================================
 input_path = 'UK_Success_Prepped_FINAL.csv'
-output_path = 'UK_Success_Prepped_RESCUED.csv'
+output_path = 'UK_Success_Prepped_AgeAmmend.csv'
 cache_path = 'wikidata_dob_cache.json'
 
 print("--- WIKIDATA AGE IMPUTATION PIPELINE ---")
