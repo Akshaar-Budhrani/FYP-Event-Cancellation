@@ -1,0 +1,120 @@
+import pandas as pd
+import requests
+import time
+import os
+import json
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+input_path = 'UK_Success_Data_Set.csv'
+output_path = 'UK_Success_Prepped_FINAL.csv'
+cache_path = 'artist_entity_cache.json'
+contact_email = 'Akshaar.Budhrani@Bayes.city.ac.uk'
+
+print("--- PREPPING SUCCESS DATASET ---")
+df = pd.read_csv(input_path, low_memory=False)
+
+# 1. Standardize Event Dates
+df['eventDate'] = pd.to_datetime(df['eventDate'], dayfirst=True, errors='coerce')
+df['Cancelled'] = 0
+
+# ==========================================
+# 2. API LOOKUP WITH SAVE STATE CACHE
+# ==========================================
+unique_artists = df.dropna(subset=['artist.mbid'])['artist.mbid'].unique()
+print(f"\nTotal unique artists in dataset: {len(unique_artists)}")
+
+artist_data_dict = {}
+
+# Load existing cache to prevent redundant API calls
+if os.path.exists(cache_path):
+    with open(cache_path, 'r') as f:
+        artist_data_dict = json.load(f)
+    print(f"Loaded {len(artist_data_dict)} previously saved artists from cache.")
+
+remaining_artists = len(unique_artists) - len(artist_data_dict)
+if remaining_artists > 0:
+    print(f"Fetching remaining {remaining_artists} artists. Expected time: {round(remaining_artists * 1.1 / 60, 1)} minutes.")
+
+headers = {'User-Agent': f'ActuarialDissertationModel/1.0 ( {contact_email} )'}
+
+for count, mbid in enumerate(unique_artists):
+    if mbid not in artist_data_dict:
+        url = f"https://musicbrainz.org/ws/2/artist/{mbid}?fmt=json"
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Extract formation/birth year
+                begin_date = data.get('life-span', {}).get('begin', None)
+                if begin_date and len(str(begin_date)) == 4:
+                    begin_date = f"{begin_date}-01-01"
+                    
+                entity_type = data.get('type', 'Unknown')
+                artist_data_dict[mbid] = {'begin': begin_date, 'type': entity_type}
+            else:
+                artist_data_dict[mbid] = {'begin': None, 'type': 'Unknown'}
+        except:
+            artist_data_dict[mbid] = {'begin': None, 'type': 'Error'}
+            
+        time.sleep(1.1) # Strict adherence to MusicBrainz API rate limits
+
+    if (count + 1) % 100 == 0:
+        print(f"Processed {count + 1} of {len(unique_artists)} artists...")
+
+# Save dictionary to cache
+with open(cache_path, 'w') as f:
+    json.dump(artist_data_dict, f)
+
+# ==========================================
+# 3. MAP DATA TO DATAFRAME
+# ==========================================
+print("\nMapping API data to dataset...")
+
+def safe_get_begin(mbid):
+    if pd.isna(mbid): return None
+    data = artist_data_dict.get(mbid)
+    if isinstance(data, dict): return data.get('begin')
+    return None
+
+def safe_get_type(mbid):
+    if pd.isna(mbid): return 'Unknown'
+    data = artist_data_dict.get(mbid)
+    if isinstance(data, dict): return data.get('type')
+    return 'Unknown'
+
+df['Artist_Begin_Date'] = df['artist.mbid'].map(safe_get_begin)
+df['Entity_Type'] = df['artist.mbid'].map(safe_get_type)
+
+# ==========================================
+# 4. ACTUARIAL MATH: ENTITY YEARS ACTIVE
+# ==========================================
+print("Calculating Entity Years Active...")
+df['Artist_Begin_Date'] = pd.to_datetime(df['Artist_Begin_Date'], errors='coerce')
+
+# Calculate years active at the exact time of the event
+df['Entity_Years_Active'] = (df['eventDate'] - df['Artist_Begin_Date']).dt.days / 365.25
+
+# The Missing Indicator Rule: Flag missing ages and impute with 0
+df['Age_Missing'] = df['Entity_Years_Active'].isna().astype(int)
+df['Entity_Years_Active'] = df['Entity_Years_Active'].fillna(0).round(1)
+
+# ==========================================
+# 5. FINAL CLEANSING & EXPORT
+# ==========================================
+# Drop any rows where the original date or coordinates were fundamentally broken
+df = df.dropna(subset=['eventDate', 'venue.city.coords.lat'])
+
+final_columns = [
+    'artist.name', 'eventDate', 'venue.city.name', 'venue.city.coords.lat', 'venue.city.coords.long',
+    'Entity_Type', 'Age_Missing', 'Entity_Years_Active', 'Cancelled'
+]
+
+df_final = df[final_columns].copy()
+df_final.to_csv(output_path, index=False)
+
+print("\nData Preparation Complete.")
+print(f"Successfully processed and prepped {len(df_final)} rows.")
+print(f"Master file saved to: {output_path}")
