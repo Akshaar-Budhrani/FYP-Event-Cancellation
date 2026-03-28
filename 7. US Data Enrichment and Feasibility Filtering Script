@@ -1,0 +1,125 @@
+import pandas as pd
+import requests
+import time
+import numpy as np
+import json
+import os
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+INPUT_FILE = 'US_2024_compiled.xlsx'
+OUTPUT_FILE = 'US_2024_FULL_ENRICHED.csv'
+CACHE_FILE = 'us_musicbrainz_cache.json'
+CONTACT_EMAIL = 'Akshaar.Budhrani@Bayes.city.ac.uk'
+headers = {
+    'User-Agent': f'Actuarial_Dissertation_Research/1.0 ( {CONTACT_EMAIL} )',
+    'Accept': 'application/json'
+}
+
+def fetch_artist_data(mbid, artist_name):
+    """
+    Fetches Entity Type and Formation/Birth Year from MusicBrainz.
+    """
+    url = f"https://musicbrainz.org/ws/2/artist/{mbid}?fmt=json"
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            entity_type = data.get('type', 'Unknown')
+            life_span = data.get('life-span', {})
+            begin_date = life_span.get('begin', '')
+            start_year = int(begin_date[:4]) if begin_date and len(begin_date) >= 4 else np.nan
+            return entity_type, start_year
+        else:
+            print(f"Warning: API Error for {artist_name} (Status {response.status_code})")
+            return 'Unknown', np.nan
+    except Exception as e:
+        print(f"Connection Error for {artist_name}: {e}")
+        return 'Unknown', np.nan
+
+
+print("--- US DATA ENRICHMENT & FEASIBILITY PIPELINE ---")
+# ==========================================
+# 1. LOAD DATASET & CACHE
+# ==========================================
+print(f"Loading primary dataset: {INPUT_FILE}...")
+df = pd.read_excel(INPUT_FILE)
+df['Cancelled'] = 0
+
+# Load existing cache to prevent redundant API calls
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, 'r') as f:
+        artist_cache = json.load(f)
+    print(f"Loaded {len(artist_cache)} previously cached artists.")
+else:
+    artist_cache = {}
+    print("No previous cache found. Initializing new memory bank.")
+
+# ==========================================
+# 2. ISOLATE UNIQUE ARTISTS
+# ==========================================
+unique_artists = df[['artist.mbid', 'artist.name']].drop_duplicates().dropna(subset=['artist.mbid'])
+total_unique = len(unique_artists)
+print(f"Found {total_unique} unique artists requiring resolution.\n")
+
+# ==========================================
+# 3. QUERY MUSICBRAINZ API
+# ==========================================
+for index, row in unique_artists.iterrows():
+    mbid = row['artist.mbid']
+    name = row['artist.name']
+
+    # Skip if artist is already in cache
+    if mbid in artist_cache:
+        continue
+
+    print(f"Fetching [New Artist]: {name}...")
+    e_type, start_year = fetch_artist_data(mbid, name)
+    years_active = 2024 - start_year if pd.notna(start_year) else np.nan
+
+    # Save to memory bank
+    artist_cache[mbid] = {
+        'Entity_Type': e_type,
+        'Entity_Years_Active': years_active
+    }
+
+    # Write incrementally to disk to prevent data loss on crash
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(artist_cache, f)
+
+    # Strict adherence to API rate limits
+    time.sleep(1.1)
+
+print("\nEntity resolution complete. All artists cached.")
+
+# ==========================================
+# 4. MAP DATA TO DATAFRAME
+# ==========================================
+print("Mapping resolved data back to the primary dataset...")
+df['Entity_Type'] = df['artist.mbid'].map(lambda x: artist_cache.get(x, {}).get('Entity_Type', 'Unknown'))
+df['Entity_Years_Active'] = df['artist.mbid'].map(lambda x: artist_cache.get(x, {}).get('Entity_Years_Active', np.nan))
+
+# ==========================================
+# 5. ACTUARIAL FEASIBILITY FILTERS
+# ==========================================
+print("Applying physical and temporal feasibility bounds...")
+initial_rows = len(df)
+
+# The Entity Resolution Rule: Enforce biological and historical limits
+valid_persons = (df['Entity_Type'] == 'Person') & (df['Entity_Years_Active'] >= 16) & (df['Entity_Years_Active'] <= 85)
+valid_groups = (df['Entity_Type'] == 'Group') & (df['Entity_Years_Active'] >= 0) & (df['Entity_Years_Active'] <= 65)
+
+df_clean = df[valid_persons | valid_groups].copy()
+
+final_rows = len(df_clean)
+dropped_rows = initial_rows - final_rows
+
+print(f"Data validation complete. Dropped {dropped_rows} non-viable rows (missing data or failed age bounds).")
+
+# ==========================================
+# 6. EXPORT ENRICHED DATA
+# ==========================================
+df_clean.to_csv(OUTPUT_FILE, index=False)
+print(f"Final enriched dataset securely saved to: {OUTPUT_FILE}")
