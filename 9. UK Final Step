@@ -1,0 +1,73 @@
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+import numpy as np
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+INPUT_FILE = 'US_Full_Data_Without_Proximity.xlsx'
+OUTPUT_FILE = 'US_Full_Data_WITH_Proximity.xlsx'
+
+print("--- US GEOSPATIAL PROJECTION & DISTANCE PIPELINE ---")
+
+# ==========================================
+# 1. LOAD DATA & INITIALIZE SPATIAL POINTS
+# ==========================================
+print(f"Loading dataset: {INPUT_FILE}...")
+df = pd.read_excel(INPUT_FILE)
+
+# Isolate rows with valid spatial coordinates
+valid_coords = df['Latitude'].notna() & df['Longitude'].notna()
+
+print("Converting coordinates to spatial geometries...")
+# Construct Shapely Points (Note: Longitude maps to the X-axis, Latitude to the Y-axis)
+geometry = [Point(xy) for xy in zip(df.loc[valid_coords, 'Longitude'], df.loc[valid_coords, 'Latitude'])]
+
+# Initialize the GeoDataFrame using the standard WGS 84 coordinate reference system
+gdf_venues = gpd.GeoDataFrame(
+    df.loc[valid_coords],
+    geometry=geometry,
+    crs="EPSG:4326" 
+)
+
+# ==========================================
+# 2. FETCH HIGH-RESOLUTION COASTLINE DATA
+# ==========================================
+print("Fetching 1:10m physical coastline shapefiles from Natural Earth...")
+coastline_url = "https://naturalearth.s3.amazonaws.com/10m_physical/ne_10m_coastline.zip"
+gdf_coast = gpd.read_file(coastline_url)
+
+# ==========================================
+# 3. CRS PROJECTION & GEOMETRY UNION
+# ==========================================
+print("Re-projecting CRS to calculate true planar distances...")
+# EPSG:5070 (CONUS Albers) is specifically designed to minimize distortion 
+# across the contiguous United States, allowing for accurate distance math in meters.
+gdf_venues_proj = gdf_venues.to_crs("EPSG:5070")
+gdf_coast_proj = gdf_coast.to_crs("EPSG:5070")
+
+# Merge the entire coastline into a single unary union geometry.
+# This heavily optimizes the computational complexity of the distance algorithm.
+single_coastline = gdf_coast_proj.geometry.unary_union
+
+# ==========================================
+# 4. DISTANCE CALCULATION
+# ==========================================
+print("Calculating Euclidean distance to the physical coastline for all venues...")
+# .distance() returns the distance in the CRS unit (meters). Convert to Kilometers.
+distances_km = gdf_venues_proj.geometry.distance(single_coastline) / 1000
+
+# Map the calculated geographic distances back to the main dataframe
+df['Distance_to_Coast_km'] = np.nan
+df.loc[valid_coords, 'Distance_to_Coast_km'] = distances_km
+
+# Round to 2 decimal places to prevent floating-point precision issues in the GLM
+df['Distance_to_Coast_km'] = df['Distance_to_Coast_km'].round(2)
+
+# ==========================================
+# 5. EXPORT FINAL DATASET
+# ==========================================
+df.to_excel(OUTPUT_FILE, index=False)
+print("\nGeospatial Pipeline Complete.")
+print(f"Final dataset with proximity variable saved to: {OUTPUT_FILE}")
