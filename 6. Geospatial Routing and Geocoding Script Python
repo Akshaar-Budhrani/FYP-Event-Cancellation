@@ -1,0 +1,77 @@
+import pandas as pd
+import time
+import os
+from geopy.geocoders import Nominatim
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+input_path = 'UK_Failure_Dataset.csv'
+output_path = 'UK_Failure_Set_With_Coordinates.csv'
+contact_email = 'Akshaar.Budhrani@bayes.city.ac.uk' # Update this before uploading to GitHub
+
+print("--- GEOSPATIAL ENGINEERING PIPELINE ---")
+print("Loading cancellation dataset for coordinate mapping...")
+df = pd.read_csv(input_path)
+
+# Initialize the free OpenStreetMap Geocoder
+# A custom user agent is required by Nominatim's Terms of Use
+geolocator = Nominatim(user_agent=f"ActuarialDissertationModel_Geo/1.0 ({contact_email})")
+
+# ==========================================
+# GEOCODING FUNCTION WITH FALLBACK LOGIC
+# ==========================================
+def get_lat_long(location):
+    """
+    Translates raw location/venue strings into latitude and longitude coordinates.
+    Includes a fallback mechanism to wider geographical regions if the exact
+    venue is not indexed by OpenStreetMap.
+    """
+    # Skip empty or 'Unknown' locations
+    if pd.isna(location) or str(location).strip() == '' or location == 'Unknown':
+        return pd.Series([None, None])
+
+    try:
+        # ATTEMPT 1: Exact string search
+        loc = geolocator.geocode(f"{location}, UK", timeout=10)
+        time.sleep(1.1)  # Strict adherence to Nominatim API rate limits (max 1 req/sec)
+
+        if loc:
+            return pd.Series([loc.latitude, loc.longitude])
+
+        # ATTEMPT 2: Fallback parsing
+        # If the specific venue fails (e.g., "Standon Lordship, Hertfordshire"),
+        # split by comma and search the broader region/county ("Hertfordshire")
+        if ',' in str(location):
+            city_county = str(location).split(',')[-1].strip()
+            loc_fallback = geolocator.geocode(f"{city_county}, UK", timeout=10)
+            time.sleep(1.1)
+
+            if loc_fallback:
+                print(f"Fallback Used: '{location}' -> Geocoded as '{city_county}'")
+                return pd.Series([loc_fallback.latitude, loc_fallback.longitude])
+
+        print(f"Warning: Could not geocode location '{location}'")
+        return pd.Series([None, None])
+
+    except Exception as e:
+        print(f"API Error on '{location}': {e}")
+        return pd.Series([None, None])
+
+# ==========================================
+# EXECUTE MAPPING & EXPORT
+# ==========================================
+print("Initiating API calls. This may take a few minutes...")
+
+# Apply the function and create standard columns matching the Success dataset
+df[['venue.city.coords.lat', 'venue.city.coords.long']] = df['Location/Venue'].apply(get_lat_long)
+
+# Save the finalized geospatial data
+df.to_csv(output_path, index=False)
+
+print("\nGeospatial Routing Complete.")
+print(f"Processed dataset saved to: {output_path}")
+
+# Display a brief spatial integrity check
+print("\nCoordinate mapping preview:")
+print(df[['Location/Venue', 'venue.city.coords.lat', 'venue.city.coords.long']].head())
