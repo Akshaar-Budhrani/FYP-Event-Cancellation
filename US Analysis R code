@@ -1,260 +1,279 @@
 # ==============================================================================
 # DISSERTATION: US EVENT CANCELLATION GLM ANALYSIS
-# Final Master Script (Stepwise, Log-Transform, Interaction & Downsampling)
+# Statistical Modelling and Predictive Performance Validation
 # ==============================================================================
 
-# ── 1. Load Required Libraries ────────────────────────────────────────────────
-library(readxl)             # Reading Excel files
-library(tidyverse)          # Data manipulation and plotting
-library(car)                # VIF for multicollinearity
-library(pROC)               # ROC curve and AUC
-library(ResourceSelection)  # Hosmer-Lemeshow test
-library(caret)              # Stratified Train/Test splits & Downsampling
+# 1. Environment Setup and Libraries
+# ------------------------------------------------------------------------------
+library(readxl)           # Data ingestion
+library(tidyverse)        # Data manipulation and visualization
+library(car)              # Diagnostic tools
+library(pROC)             # ROC/AUC performance metrics
+library(ResourceSelection)# Goodness-of-fit testing
+library(caret)            # Machine learning workflow
+library(themis)           # SMOTE implementation
 
-# ── 2. Load Data & Clean Column Names ─────────────────────────────────────────
-df <- read_excel("US Final Data.xlsx")
+# 2. Data Import and Pre-Processing
+# ------------------------------------------------------------------------------
+# Load the US-specific portfolio
+df <- read_excel("US_Full_Data.xlsx")
 
-# Rename columns to remove spaces and match R syntax conventions
-colnames(df)[colnames(df) == "Group or Person"] <- "Entity_Type"
-colnames(df)[colnames(df) == "Entity Years Active"] <- "Entity_Years_Active"
-colnames(df)[colnames(df) == "Weather Risk Season"] <- "Weather_Risk_Season"
+# Standardize variable names for GLM consistency
+df <- df %>% 
+  rename(
+    Entity_Type = `Group or Person`,
+    Weather_Risk_Season = `Weather Risk Season`,
+    Entity_Years_Active = `Entity Years Active`
+  )
 
-# Set baselines based on largest meaningful level
-df$Entity_Type <- base::factor(df$Entity_Type, levels = c("Person", "Group"))
-df$Weather_Risk_Season <- base::factor(df$Weather_Risk_Season, levels = c(0, 1))
+# Set factor levels and establish baseline reference categories
+df$Entity_Type <- factor(df$Entity_Type, levels = c("Person", "Group"))
+df$Weather_Risk_Season <- factor(df$Weather_Risk_Season, levels = c(0, 1))
 
-# Target variable numeric for GLM
+# Ensure target variable is integer for binomial modeling
 df$Cancelled <- as.integer(df$Cancelled)
 
-# Drop any rows with NAs in our key variables to prevent model crashing
-df <- df %>% drop_na(Entity_Type, Entity_Years_Active, Distance_to_Coast_km, Weather_Risk_Season, Cancelled)
-
-# ── 3. Exploratory Data Analysis (EDA) ────────────────────────────────────────
-cat("\n--- Class Balance ---\n")
+# 3. Exploratory Data Analysis (EDA)
+# ------------------------------------------------------------------------------
+# Review class distribution
+cat("\n--- US Market Class Distribution ---\n")
 print(table(df$Cancelled))
 
-cat("\n--- Cancellation rate by Entity Type ---\n")
+# Empirical failure rates by act type
+cat("\n--- Observed Cancellation Frequency by Entity Type ---\n")
 print(df %>%
         group_by(Entity_Type) %>%
-        summarise(n = n(), n_cancelled = sum(Cancelled), cancel_rate = mean(Cancelled)))
+        summarise(
+          Total_Events = n(), 
+          Failures = sum(Cancelled), 
+          Failure_Rate = mean(Cancelled)
+        ))
 
-cat("\n--- Cancellation rate by Weather Season (1 = Aug-Oct) ---\n")
-print(df %>%
-        group_by(Weather_Risk_Season) %>%
-        summarise(n = n(), n_cancelled = sum(Cancelled), cancel_rate = mean(Cancelled)))
-
-# Plot 1: Boxplots
-par(mfrow = c(1, 2))
-boxplot(Entity_Years_Active ~ Cancelled, data = df,
-        xlab = "Outcome", ylab = "Entity Years Active",
-        names = c("Successful", "Cancelled"), col = c("lightblue", "salmon"))
-
-boxplot(Distance_to_Coast_km ~ Cancelled, data = df,
-        xlab = "Outcome", ylab = "Distance to Coast (km)",
-        names = c("Successful", "Cancelled"), col = c("lightblue", "salmon"))
-par(mfrow = c(1, 1)) # IMPORTANT: Reset plot window
-
-
-# Plot 2: Class Balance Bar Chart
+# Figure 1: Visualizing Class Imbalance
 balance_summary <- df %>%
   group_by(Cancelled) %>%
   summarise(Count = n()) %>%
   mutate(Outcome = ifelse(Cancelled == 0, "Successful", "Cancelled"))
 
-balance_summary$Outcome <- base::factor(balance_summary$Outcome, levels = c("Successful", "Cancelled"))
+balance_summary$Outcome <- factor(balance_summary$Outcome, levels = c("Successful", "Cancelled"))
 
-fig1 <- ggplot(balance_summary, aes(x = Outcome, y = Count, fill = Outcome)) +
+ggplot(balance_summary, aes(x = Outcome, y = Count, fill = Outcome)) +
   geom_bar(stat = "identity", width = 0.5, color = "black", show.legend = FALSE) +
   geom_text(aes(label = Count), vjust = -0.8, size = 5, fontface = "bold") +
   scale_fill_manual(values = c("Successful" = "lightblue", "Cancelled" = "salmon")) +
   scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
   labs(
-    title = "US Class Balance of Successful vs. Cancelled Events",
+    title = "US Class Balance: Successful vs. Cancelled Events",
     x = "Event Outcome",
     y = "Frequency"
   ) +
   theme_classic(base_size = 14) +
   theme(plot.title = element_text(hjust = 0.5, face = "bold"))
 
-print(fig1)
-# ── 4. Establish Baseline (Null) Accuracy ─────────────────────────────────────
+# Figure 2: Covariate Distribution across Outcomes
+par(mfrow = c(1, 2))
+boxplot(Entity_Years_Active ~ Cancelled, data = df,
+        xlab = "Outcome", ylab = "Years Active",
+        names = c("Success", "Fail"), col = c("lightblue", "salmon"),
+        main = "Longevity Dist.")
+
+boxplot(Distance_to_Coast_km ~ Cancelled, data = df,
+        xlab = "Outcome", ylab = "Distance to Coast (km)",
+        names = c("Success", "Fail"), col = c("lightblue", "salmon"),
+        main = "Coastal Dist.")
+par(mfrow = c(1, 1))
+
+# 4. Baseline Establishment (Null Classifier)
+# ------------------------------------------------------------------------------
+# Calculate accuracy of a naive model predicting 100% success
 null_accuracy <- sum(df$Cancelled == 0) / nrow(df)
-cat("\nBaseline (Null) Accuracy:", round(null_accuracy, 4), "\n")
+cat("\nTheoretical Null Accuracy:", round(null_accuracy, 4), "\n")
 
-# ── 5. Model Selection: Stepwise (Forward, Backward, Both) ────────────────────
-model_null <- glm(Cancelled ~ 1, data = df, family = binomial(link = "logit"))
-model_full <- glm(Cancelled ~ Entity_Type + Entity_Years_Active +
-                    Distance_to_Coast_km + Weather_Risk_Season,
-                  data = df, family = binomial(link = "logit"))
-
-cat("\n--- Running Stepwise Selection ---\n")
-model_both <- step(model_null, scope = list(lower = model_null, upper = model_full), direction = "both", trace = FALSE)
-
-cat("AIC of Both Stepwise :", AIC(model_both), "\n")
-cat("Winning Stepwise Formula:", deparse(formula(model_both)), "\n")
-
-# ── Helper Function for Comparison Tables ─────────────────────────────────────
-# This function calculates AIC, BIC, and Pseudo R-Squared for any list of models
-generate_comp_table <- function(model_list) {
-  comp <- data.frame(
-    Model = names(model_list),
-    AIC = sapply(model_list, AIC),
-    BIC = sapply(model_list, BIC),
-    Deviance = sapply(model_list, function(m) m$deviance),
-    McFadden_R2 = sapply(model_list, function(m) 1 - (m$deviance / m$null.deviance)),
-    Adj_McFadden_R2 = sapply(model_list, function(m) {
-      1 - (((-0.5 * m$deviance) - length(coef(m))) / (-0.5 * m$null.deviance))
-    })
-  )
-  comp[,-1] <- round(comp[,-1], 4) # Round all numbers to 4 decimal places
-  return(comp)
-}
-
-# ── 6. Table 1: Manual Comparison (Linear Additive Models) ────────────────────
-model_1 <- glm(Cancelled ~ Entity_Type, data = df, family = binomial("logit"))
-model_2 <- glm(Cancelled ~ Entity_Type + Entity_Years_Active, data = df, family = binomial("logit"))
-model_3 <- glm(Cancelled ~ Entity_Type + Entity_Years_Active + Distance_to_Coast_km, data = df, family = binomial("logit"))
-model_4 <- glm(Cancelled ~ Entity_Type + Entity_Years_Active + Distance_to_Coast_km + Weather_Risk_Season, data = df, family = binomial("logit"))
-
-cat("\n--- TABLE 1: The Base Additive Models ---\n")
-list_additive <- list(m1 = model_1, m2 = model_2, m3 = model_3, m4 = model_4)
-print(generate_comp_table(list_additive))
-
-
-# ── 6.5 TABLE 2: The Transformation Check (Linear vs. Log Distance) ───────────
-cat("\n--- TABLE 2: Log-Transforming Distance to Coast ---\n")
-# Create the new logged variable (+1 prevents log(0) errors)
-df$Log_Distance_km <- log(df$Distance_to_Coast_km + 1)
-
-# Build Model 5 with the Logged Distance
-model_5_log <- glm(Cancelled ~ Entity_Type + Entity_Years_Active + Log_Distance_km + Weather_Risk_Season, data = df, family = binomial("logit"))
-
-list_transform <- list(Model_4_Linear = model_4, Model_5_Logged = model_5_log)
-print(generate_comp_table(list_transform))
-
-cat("\nCheck if Model 5 has a lower AIC/Deviance and higher Adj R2 than Model 4.\n")
-model_best_additive <- model_5_log
-
-
-# ── 7. TABLE 3: The Interaction Check ─────────────────────────────────────────
-cat("\n--- TABLE 3: The Final Interaction Model ---\n")
-# Apply the Entity Interaction to our upgraded Log-Distance model
-model_interaction <- glm(Cancelled ~ Entity_Type * Entity_Years_Active + Log_Distance_km + Weather_Risk_Season,
-                         data = df, family = binomial(link = "logit"))
-
-list_interaction <- list(Best_Additive = model_best_additive, Final_Interaction = model_interaction)
-print(generate_comp_table(list_interaction))
-
-cat("\n--- Interaction Term Test (LRT) ---\n")
-print(anova(model_best_additive, model_interaction, test = "LRT"))
-
-cat("\n--- Full Summary of the Final Interaction Model ---\n")
-print(summary(model_interaction)$coefficients)
-
-# ── 8. Stratified Train/Test Split & DOWNSAMPLING ─────────────────────────────
+# 5. Data Partitioning
+# ------------------------------------------------------------------------------
+# Implementing a stratified 70/30 split to maintain class proportions in test data
 set.seed(123)
 train_index <- createDataPartition(as.factor(df$Cancelled), p = 0.7, list = FALSE)
-train_data_raw <- df[train_index, ]
-test_data <- df[-train_index, ]
+train_data  <- df[train_index, ]
+test_data   <- df[-train_index, ]
 
-# Downsample the training data to fix the massive class imbalance (fixes Hosmer-Lemeshow)
-train_data <- downSample(x = subset(train_data_raw, select = -Cancelled),
-                         y = as.factor(train_data_raw$Cancelled),
-                         yname = "Cancelled")
+cat("\nPartitioning Complete: Data split into Training (70%) and Testing (30%) sets.\n")
 
-# caret changes 'Cancelled' to a factor; change it back to integer for the GLM
-train_data$Cancelled <- as.integer(as.character(train_data$Cancelled))
 
-cat("\n--- Balanced Training Split (After Downsampling) ---\n")
-print(table(train_data$Cancelled))
 
-# ── 9. Train the Final Model on Balanced Data ─────────────────────────────────
-final_train_model <- glm(Cancelled ~ Entity_Type * Entity_Years_Active + Log_Distance_km + Weather_Risk_Season,
-                         data = train_data,
-                         family = binomial(link = "logit"))
+# ==============================================================================
+# 6. TRAINING CONFIGURATION (SMOTE)
+# ==============================================================================
+# Implementing SMOTE within the cross-validation framework to address extreme 
+# class imbalanc. Subsampling is performed within the folds 
+# to maintain validation integrity.
 
-cat("\n--- Final Model Summary (Trained on 50/50 Balanced Data) ---\n")
-print(summary(final_train_model)$coefficients)
-
-# ── 10. Model Diagnostics (On Training Data) ──────────────────────────────────
-pseudo_R2 <- 1 - (final_train_model$deviance / final_train_model$null.deviance)
-cat("\nMcFadden Pseudo R²:", round(pseudo_R2, 4), "\n")
-
-cat("\nHosmer-Lemeshow Goodness of Fit:\n")
-print(hoslem.test(train_data$Cancelled, fitted(final_train_model), g = 10))
-
-# ── 11. Evaluate Real-World Performance & OPTIMAL THRESHOLD ───────────────────
-# 
-pred_probs_test <- predict(final_train_model, newdata = test_data, type = "response")
-
-# Let pROC find the mathematically perfect threshold (Youden's J statistic)
-roc_test <- roc(test_data$Cancelled, pred_probs_test, quiet = TRUE)
-best_coords <- coords(roc_test, "best", ret=c("threshold", "specificity", "sensitivity"), best.method="youden")
-optimal_threshold <- best_coords$threshold[1]
-
-cat("\n--- Mathematically Optimal Threshold Found:", round(optimal_threshold, 4), "---\n")
-
-# Apply the optimal threshold
-pred_class_test <- ifelse(pred_probs_test >= optimal_threshold, 1, 0)
-conf_mat_test <- table(Predicted = pred_class_test, Actual = test_data$Cancelled)
-
-cat("\n--- Confusion Matrix using Optimal Threshold on Unseen Test Data ---\n")
-print(conf_mat_test)
-
-test_accuracy <- mean(pred_class_test == test_data$Cancelled)
-cat("\nTest Accuracy:", round(test_accuracy, 4), "\n")
-
-if(ncol(conf_mat_test) == 2 && nrow(conf_mat_test) == 2) {
-  test_sensitivity <- conf_mat_test[2, 2] / sum(conf_mat_test[, 2])
-  test_specificity <- conf_mat_test[1, 1] / sum(conf_mat_test[, 1])
-  cat("Test Sensitivity (Recall/Catch Rate):", round(test_sensitivity, 4), "\n")
-  cat("Test Specificity (True Negative Rate):", round(test_specificity, 4), "\n")
-}
-
-# ── 12. ROC Curve & AUC ───────────────────────────────────────────────────────
-plot(roc_test, col = "red", lwd = 2,
-     main = paste("US Test Data ROC Curve | AUC =", round(auc(roc_test), 3)))
-abline(a = 0, b = 1, lty = 2, col = "grey")
-cat("\nTest AUC:", round(auc(roc_test), 4), "\n")
-
-# ── 13. Practical Application: The Underwriting Triage Tool ───────────────────
-new_obs <- data.frame(
-  Entity_Type = base::factor("Group", levels = c("Person", "Group")),
-  Entity_Years_Active = 40,
-  Log_Distance_km = log(10 + 1), # Must log the input!
-  Weather_Risk_Season = base::factor("1", levels = c(0, 1))
+ctrl <- trainControl(
+  method = "repeatedcv", 
+  number = 10, 
+  repeats = 5,
+  classProbs = TRUE, 
+  summaryFunction = twoClassSummary, # Prioritize ROC, Sens, and Spec
+  sampling = "smote"                 
 )
 
-mu_hat_new <- predict(final_train_model, newdata = new_obs, type = "response")
+# Convert target to factor for caret compatibility
+train_data$Cancelled_F <- factor(ifelse(train_data$Cancelled == 1, "Fail", "Success"), 
+                                 levels = c("Fail", "Success"))
 
-cat("\n--- Commercial Underwriting Triage Tool ---\n")
-cat("Scenario: Legacy band (40 yrs active), 10km from coast, touring in September (Weather Risk = 1).\n")
-cat("Predicted Risk Score:", round(mu_hat_new * 100, 2), "%\n")
+# ==============================================================================
+# 7. ADDITIVE MODEL EVALUATION
+# ==============================================================================
+# Defining candidate models to evaluate the incremental impact of covariates.
 
-if(mu_hat_new >= optimal_threshold) {
-  cat("Action: FLAG FOR MANUAL REVIEW (Risk exceeds", optimal_threshold*100, "% optimal threshold).\n")
+# Model 1: Baseline Entity Effect
+fit_m1 <- train(Cancelled_F ~ Entity_Type, data = train_data, 
+                method = "glm", family = "binomial", metric = "ROC", trControl = ctrl)
+
+# Model 2: Incorporating Professional Longevity
+fit_m2 <- train(Cancelled_F ~ Entity_Type + Entity_Years_Active, data = train_data, 
+                method = "glm", family = "binomial", metric = "ROC", trControl = ctrl)
+
+# Model 3: Incorporating Geospatial Proximity
+fit_m3 <- train(Cancelled_F ~ Entity_Type + Entity_Years_Active + Distance_to_Coast_km, 
+                data = train_data, method = "glm", family = "binomial", metric = "ROC", trControl = ctrl)
+
+# Model 4: Full Additive Model (Including US Seasonal Peril)
+fit_m4 <- train(Cancelled_F ~ Entity_Type + Entity_Years_Active + Distance_to_Coast_km + Weather_Risk_Season, 
+                data = train_data, method = "glm", family = "binomial", metric = "ROC", trControl = ctrl)
+
+# ==============================================================================
+# 8. PERFORMANCE COMPARISON: ADDITIVE CANDIDATES
+# ==============================================================================
+# Aggregate results from additive models to identify the optimal baseline.
+additive_comparison <- resamples(list(Model1 = fit_m1, Model2 = fit_m2, Model3 = fit_m3, Model4 = fit_m4))
+summary(additive_comparison)
+dotplot(additive_comparison, metric = "ROC", main = "ROC Comparison: Additive Candidates")
+
+# ==============================================================================
+# 9. GOODNESS-OF-FIT VALIDATION (ADDITIVE)
+# ==============================================================================
+# Statistical assessment using AIC and McFadden’s Pseudo R-Squared.
+gof_list <- list(Model1 = fit_m1$finalModel, Model2 = fit_m2$finalModel, 
+                 Model3 = fit_m3$finalModel, Model4 = fit_m4$finalModel)
+
+gof_table <- data.frame(
+  Model = names(gof_list),
+  AIC = sapply(gof_list, AIC),
+  BIC = sapply(gof_list, BIC),
+  McFadden_R2 = sapply(gof_list, function(m) { 1 - (m$deviance / m$null.deviance) }),
+  Adj_McFadden_R2 = sapply(gof_list, function(m) {
+    ll_mod <- -0.5 * m$deviance
+    ll_null <- -0.5 * m$null.deviance
+    k <- length(coef(m))
+    1 - ((ll_mod - k) / ll_null)
+  })
+)
+print(round(gof_table[,-1], 4))
+
+# Testing the Logarithmic Transformation for Geospatial Risk
+train_data$Log_Distance_km <- log(train_data$Distance_to_Coast_km + 1)
+test_data$Log_Distance_km  <- log(test_data$Distance_to_Coast_km + 1)
+
+fit_m5 <- train(
+  Cancelled_F ~ Entity_Type + Entity_Years_Active + Log_Distance_km + Weather_Risk_Season,
+  data = train_data, method = "glm", family = "binomial", metric = "ROC", trControl = ctrl
+)
+
+geo_comparison <- resamples(list(Model4_Standard = fit_m4, Model5_Logged = fit_m5))
+cat("\n--- US Geographic Sensitivity: Standard vs. Logged Distance ---\n")
+summary(geo_comparison)
+
+# ==============================================================================
+# 10. INTERACTION MODEL DEVELOPMENT
+# ==============================================================================
+# Testing the hypothesis of non-linear risk compounding between Entity Type and Age.
+fit_interaction <- train(Cancelled_F ~ Entity_Type * Entity_Years_Active + Distance_to_Coast_km + Weather_Risk_Season,
+                         data = train_data, method = "glm", family = "binomial", 
+                         metric = "ROC", trControl = ctrl)
+
+final_comparison <- resamples(list(Best_Additive = fit_m4, Interaction = fit_interaction))
+summary(final_comparison)
+dotplot(final_comparison, metric = "ROC", main = "ROC Comparison: Additive vs. Interaction")
+
+# Likelihood Ratio Test (LRT) to justify added model complexity.
+cat("\n--- Formal Likelihood Ratio Test: Additive vs. Interaction ---\n")
+lrt_result <- anova(fit_m4$finalModel, fit_interaction$finalModel, test = "LRT")
+print(lrt_result)
+
+# Conclusion Logic
+p_val <- lrt_result$`Pr(>Chi)`[2]
+if(p_val < 0.05) {
+  cat("\nConclusion: The Interaction Model is significantly superior (p =", p_val, ").\n")
 } else {
-  cat("Action: AUTO-BIND ELIGIBLE (Standard Risk).\n")
+  cat("\nConclusion: The Interaction term does not significantly improve the model.\n")
 }
 
+# To get AIC and BIC directly:
+AIC(fit_interaction$finalModel)
+BIC(fit_interaction$finalModel)
 
-# ── Custom Threshold Tuning ───────────────────────────────────────────────────
-# Let's raise the threshold to 60% to reduce false alarms
-custom_threshold <- 0.70
+# To calculate the McFadden R-Squared:
+1 - (fit_interaction$finalModel$deviance / fit_interaction$finalModel$null.deviance)
 
-pred_class_custom <- ifelse(pred_probs_test >= custom_threshold, 1, 0)
-conf_mat_custom <- table(Predicted = pred_class_custom, Actual = test_data$Cancelled)
+ll_mod <- -0.5 * fit_interaction$finalModel$deviance
+ll_null <- -0.5 * fit_interaction$finalModel$null.deviance
 
-cat("\n--- Confusion Matrix using Custom Threshold (", custom_threshold, ") ---\n")
-print(conf_mat_custom)
+k <- length(coef(fit_interaction$finalModel))
 
-# Calculate the new metrics
-if(ncol(conf_mat_custom) == 2 && nrow(conf_mat_custom) == 2) {
-  custom_acc <- mean(pred_class_custom == test_data$Cancelled)
-  custom_sens <- conf_mat_custom[2, 2] / sum(conf_mat_custom[, 2])
-  custom_spec <- conf_mat_custom[1, 1] / sum(conf_mat_custom[, 1])
-  
-  cat("New Accuracy:", round(custom_acc, 4), "\n")
-  cat("New Sensitivity (Catch Rate):", round(custom_sens, 4), "\n")
-  cat("New Specificity (True Negative Rate):", round(custom_spec, 4), "\n")
+
+adj_r2 <- 1 - ((ll_mod - k) / ll_null)
+
+
+print(adj_r2)
+# ==============================================================================
+# 11. PARAMETER ANALYSIS
+# ==============================================================================
+# Extracting final coefficient estimates to derive rating relativities.
+summary_final <- summary(fit_interaction$finalModel)
+coef_table <- as.data.frame(summary_final$coefficients)
+colnames(coef_table) <- c("Estimate", "Std.Error", "z-value", "Pr(>z)")
+print(round(coef_table, 4))
+
+# ==============================================================================
+# 12. OUT-OF-SAMPLE VALIDATION
+# ==============================================================================
+# Assessing predictive performance on the held-out 30% imbalanced test set.
+test_probs <- predict(fit_interaction, newdata = test_data, type = "prob")$Fail
+roc_test <- roc(test_data$Cancelled, test_probs, quiet = TRUE)
+plot(roc_test, col = "darkgreen", lwd = 2, main = paste("US Test Data ROC | AUC =", round(auc(roc_test), 3)))
+abline(a = 0, b = 1, lty = 2, col = "grey")
+
+# ==============================================================================
+# 13. CLASSIFICATION AND THRESHOLD TUNING
+# ==============================================================================
+# Reframing the GLM as a Triage Tool using a commercial probability threshold.
+tuned_threshold <- 0.61
+pred_class_test <- factor(ifelse(test_probs >= tuned_threshold, "Fail", "Success"), levels = c("Fail", "Success"))
+actual_class_test <- factor(ifelse(test_data$Cancelled == 1, "Fail", "Success"), levels = c("Fail", "Success"))
+
+conf_mat <- confusionMatrix(pred_class_test, actual_class_test)
+print(conf_mat$table)
+print(conf_mat$byClass[c("Sensitivity", "Specificity")])
+
+# ==============================================================================
+# 14. COMMERCIAL IMPLEMENTATION (TRIAGE)
+# ==============================================================================
+# Case Study: Automating a manual review flag for a high-risk profile.
+high_risk_scenario <- data.frame(
+  Entity_Type = factor("Group", levels = c("Person", "Group")),
+  Entity_Years_Active = 40, 
+  Distance_to_Coast_km = 10,
+  Weather_Risk_Season = factor(1, levels = c(0, 1)) 
+)
+
+risk_score <- predict(fit_interaction, newdata = high_risk_scenario, type = "prob")$Fail
+cat("\n--- Underwriting Triage Tool Output ---\n")
+cat("Risk Profile: Legacy Band (40yrs) in Peak Peril Window.\n")
+cat("Predicted Probability of Cancellation:", round(risk_score * 100, 2), "%\n")
+
+if(risk_score >= tuned_threshold) {
+  cat("Result: FLAG FOR MANUAL UNDERWRITING REVIEW\n")
+} else {
+  cat("Result: AUTO-BIND ELIGIBLE\n")
 }
